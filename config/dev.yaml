@@ -1,0 +1,31 @@
+api:
+  host: "0.0.0.0"
+  port: 3000
+postgres:
+  dsn: "postgres://dev:dev@postgres:5432/app_dev"
+  table: "entities"
+redis:
+  url: "redis://redis:6379"
+  mode: "cache"
+  ttl: 60
+kafka:
+  brokers: "kafka:19092"
+  group: "dev-group"
+schemas:
+  - name: "user"
+    current_version: 3
+    versions:
+      - version: 1
+        fields:
+          name: { type: "string", required: true }
+      - version: 2
+        fields:
+          name: { type: "string", required: true }
+          email: { type: "string", required: false }
+        migration_from: 1
+      - version: 3
+        fields:
+          name: { type: "string", required: true }
+          email: { type: "string", required: true }
+          phone: { type: "string", required: false }
+        migration_from: 2
