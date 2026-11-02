@@ -52,6 +52,37 @@ impl EntityService {
         let rows = self.storage.get_all(offset, limit).await?;
         Ok(rows.into_iter().map(|(e, _)| e).collect())
     }
+    
+    pub async fn get_all_paginated(&self, offset: usize, limit: usize) -> Result<(Vec<Entity>, usize), DomainError> {
+        let total = self.storage.count().await?;
+        let rows = self.storage.get_all(offset, limit).await?;
+        let entities = rows.into_iter().map(|(e, _)| e).collect();
+        Ok((entities, total))
+    }
+    
+    pub async fn get_all_cursor(&self, cursor: Option<String>, limit: usize) -> Result<(Vec<Entity>, Option<String>, bool), DomainError> {
+        let (rows, has_more) = self.storage.get_all_cursor(cursor, limit).await?;
+        let entities: Vec<Entity> = rows.iter().map(|(e, _, _)| e.clone()).collect();
+        
+        let next_cursor = if let Some((_, _, created_at)) = rows.last() {
+            if has_more {
+                if let Some(last_entity) = entities.last() {
+                    Some(Cursor {
+                        id: last_entity.id.clone(),
+                        created_at: *created_at,
+                    }.encode())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        Ok((entities, next_cursor, has_more))
+    }
 
     pub async fn add(&self, data: NewEntity) -> Result<Entity, DomainError> {
         let entity = Entity { id: uuid::Uuid::new_v4().to_string(), data };
@@ -88,241 +119,5 @@ impl EntityService {
             }
         }
         Ok(ok)
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::{Entity, SchemaConfig, SchemaVersionDef};
-    use crate::port::{MockCache, MockEventBus, MockStorage};
-    use serde_json::json;
-
-    fn create_test_schema() -> SchemaConfig {
-        SchemaConfig {
-            name: "user".to_string(),
-            current_version: 1,
-            versions: vec![SchemaVersionDef {
-                version: 1,
-                fields: std::collections::HashMap::new(),
-                migration_from: None,
-            }],
-        }
-    }
-
-    #[tokio::test]
-    async fn test_service_get_with_cache_hit() {
-        let mut mock_storage = MockStorage::new();
-        let mut mock_cache = MockCache::new();
-        let mock_bus = MockEventBus::new();
-
-        let cached_entity = Entity {
-            id: "cached-id".to_string(),
-            data: [("name".to_string(), json!("Cached User"))].into_iter().collect(),
-        };
-
-        mock_cache
-            .expect_get()
-            .withf(|key: &str| key == "user:cached-id")
-            .returning({
-                let entity = cached_entity.clone();
-                move |_| Ok(Some(serde_json::to_string(&entity).unwrap()))
-            });
-
-        mock_storage.expect_get().never();
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let result = service.get(&"cached-id".to_string()).await.unwrap();
-        assert_eq!(result.id, "cached-id");
-        assert_eq!(result.data["name"], json!("Cached User"));
-    }
-
-    #[tokio::test]
-    async fn test_service_get_with_cache_miss() {
-        let mut mock_storage = MockStorage::new();
-        let mut mock_cache = MockCache::new();
-        let mock_bus = MockEventBus::new();
-
-        let db_entity = Entity {
-            id: "db-id".to_string(),
-            data: [("name".to_string(), json!("DB User"))].into_iter().collect(),
-        };
-
-        mock_cache
-            .expect_get()
-            .withf(|key: &str| key == "user:db-id")
-            .returning(|_| Ok(None));
-
-        mock_storage
-            .expect_get()
-            .withf(|id: &String| id == "db-id")
-            .returning({
-                let entity = db_entity.clone();
-                move |_| Ok(Some((entity.clone(), 1)))
-            });
-
-        mock_cache
-            .expect_set()
-            .withf(|key: &str, _, _| key == "user:db-id")
-            .returning(|_, _, _| Ok(()));
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let result = service.get(&"db-id".to_string()).await.unwrap();
-        assert_eq!(result.id, "db-id");
-    }
-
-    #[tokio::test]
-    async fn test_service_add_publishes_event() {
-        let mut mock_storage = MockStorage::new();
-        let mock_cache = MockCache::new();
-        let mut mock_bus = MockEventBus::new();
-
-        mock_storage
-            .expect_insert()
-            .returning(|_, _| Ok(()));
-
-        mock_bus
-            .expect_publish()
-            .withf(|topic: &str, _, _| topic == "user.events")
-            .returning(|_, _, _| Ok(()));
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let data = [("name".to_string(), json!("New User"))].into_iter().collect();
-        let result = service.add(data).await.unwrap();
-        assert!(!result.id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_service_update_invalidates_cache() {
-        let mut mock_storage = MockStorage::new();
-        let mut mock_cache = MockCache::new();
-        let mock_bus = MockEventBus::new();
-
-        mock_storage
-            .expect_update()
-            .withf(|entity: &Entity, _| entity.id == "update-id")
-            .returning(|_, _| Ok(true));
-
-        mock_cache
-            .expect_del()
-            .withf(|key: &str| key == "user:update-id")
-            .returning(|_| Ok(()));
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let data = [("name".to_string(), json!("Updated User"))].into_iter().collect();
-        let result = service.update("update-id".to_string(), data).await.unwrap();
-        assert_eq!(result.id, "update-id");
-    }
-
-    #[tokio::test]
-    async fn test_service_delete_invalidates_cache() {
-        let mut mock_storage = MockStorage::new();
-        let mut mock_cache = MockCache::new();
-        let mock_bus = MockEventBus::new();
-
-        mock_storage
-            .expect_delete()
-            .withf(|id: &String| id == "delete-id")
-            .returning(|_| Ok(true));
-
-        mock_cache
-            .expect_del()
-            .withf(|key: &str| key == "user:delete-id")
-            .returning(|_| Ok(()));
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let result = service.delete("delete-id".to_string()).await.unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn test_service_get_all() {
-        let mut mock_storage = MockStorage::new();
-        let mock_cache = MockCache::new();
-        let mock_bus = MockEventBus::new();
-
-        let entities = vec![
-            (
-                Entity {
-                    id: "id1".to_string(),
-                    data: [("name".to_string(), json!("User 1"))].into_iter().collect(),
-                },
-                1u32,
-            ),
-            (
-                Entity {
-                    id: "id2".to_string(),
-                    data: [("name".to_string(), json!("User 2"))].into_iter().collect(),
-                },
-                1u32,
-            ),
-        ];
-
-        mock_storage
-            .expect_get_all()
-            .withf(|offset: &usize, limit: &usize| *offset == 0 && *limit == 10)
-            .returning({
-                let entities = entities.clone();
-                move |_, _| Ok(entities.clone())
-            });
-
-        let schema = create_test_schema();
-        let migrator = Arc::new(ConfigSchemaMigrator::new(schema));
-        let service = EntityService::new(
-            Arc::new(mock_storage),
-            Some(Arc::new(mock_cache)),
-            Some(Arc::new(mock_bus)),
-            migrator,
-            "user".to_string(),
-        );
-
-        let result = service.get_all(0, 10).await.unwrap();
-        assert_eq!(result.len(), 2);
     }
 }

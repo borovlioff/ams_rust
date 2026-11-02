@@ -6,7 +6,7 @@ pub mod port;
 
 pub use application::EntityService;
 pub use config::AppConfig;
-pub use domain::{ConfigSchemaMigrator, EntityId, NewEntity};
+pub use domain::{ConfigSchemaMigrator, EntityId, NewEntity, Cursor};
 pub use port::{Cache, EventBus, Storage};
 
 use std::sync::Arc;
@@ -14,15 +14,36 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing:: get,
+    routing::get,
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Clone)]
 pub struct Pagination {
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct CursorPagination {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct PaginatedResponse<T> {
+    pub data: Vec<T>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Serialize)]
+pub struct CursorResponse<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
@@ -33,6 +54,7 @@ pub struct AppState {
 pub fn create_app_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "OK" }))
+        .route("/api/v1/entities/cursor", get(get_all_cursor))
         .route("/api/v1/entities", get(get_all).post(add))
         .route("/api/v1/entities/:id", get(get_by_id).put(update).delete(del))
         .with_state(state)
@@ -42,7 +64,19 @@ async fn get_all(
     State(s): State<AppState>,
     Query(p): Query<Pagination>,
 ) -> Result<impl IntoResponse, AppError> {
-    Ok(Json(s.service.get_all(p.offset.unwrap_or(0), p.limit.unwrap_or(100)).await?))
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(100);
+    let (data, total) = s.service.get_all_paginated(offset, limit).await?;
+    Ok(Json(PaginatedResponse { data, total, offset, limit }))
+}
+
+async fn get_all_cursor(
+    State(s): State<AppState>,
+    Query(p): Query<CursorPagination>,
+) -> Result<impl IntoResponse, AppError> {
+    let limit = p.limit.unwrap_or(100);
+    let (data, next_cursor, has_more) = s.service.get_all_cursor(p.cursor, limit).await?;
+    Ok(Json(CursorResponse { data, next_cursor, has_more }))
 }
 
 async fn get_by_id(
